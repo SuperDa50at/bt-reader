@@ -4,12 +4,14 @@
 #include <storage/storage.h>
 #include <bt/bt_service/bt.h>
 #include <profiles/serial_profile.h>
+#include <stdio.h>
 #include <string.h>
 
 #define TEXT_MAX 8192
 #define LINE_MAX 1024
 #define COLS     22
 #define ROWS     6
+#define RX_BUF   512
 
 #define SAVE_DIR  EXT_PATH("apps_data/bt_reader")
 #define SAVE_FILE SAVE_DIR "/received.txt"
@@ -36,6 +38,8 @@ typedef struct {
     int scroll;
     bool connected;
     bool dirty;
+    uint32_t rx_events;
+    uint32_t rx_bytes;
     const char* status;
 } App;
 
@@ -105,9 +109,17 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
     if(a->len == 0) {
-        canvas_draw_str(canvas, 2, 14, a->connected ? "Connected. Send text" : "Waiting for BLE...");
-        canvas_draw_str(canvas, 2, 34, "Hold OK: delete file");
-        canvas_draw_str(canvas, 2, 44, "Up/Down: scroll");
+        canvas_draw_str(canvas, 2, 12, a->connected ? "Connected. Send text" : "Waiting for BLE...");
+        char info[40];
+        snprintf(
+            info,
+            sizeof(info),
+            "RX ev:%lu b:%lu",
+            (unsigned long)a->rx_events,
+            (unsigned long)a->rx_bytes);
+        canvas_draw_str(canvas, 2, 24, info);
+        canvas_draw_str(canvas, 2, 38, "Hold OK: delete file");
+        canvas_draw_str(canvas, 2, 48, "Up/Down: scroll");
         if(a->status) canvas_draw_str(canvas, 2, 62, a->status);
     } else {
         for(int r = 0; r < ROWS; r++) {
@@ -140,23 +152,25 @@ static void input_cb(InputEvent* e, void* ctx) {
 
 static uint16_t rx_cb(SerialServiceEvent event, void* ctx) {
     App* a = ctx;
+    furi_mutex_acquire(a->mutex, FuriWaitForever);
+    a->rx_events++;
+    a->connected = true;
     if(event.event == SerialServiceEventTypeDataReceived) {
-        furi_mutex_acquire(a->mutex, FuriWaitForever);
+        a->rx_bytes += event.data.size;
         for(uint16_t i = 0; i < event.data.size && a->len < TEXT_MAX - 1; i++) {
             char c = event.data.buffer[i];
             if(c == '\r') continue;
             a->text[a->len++] = c;
         }
         a->text[a->len] = 0;
-        a->connected = true;
         a->dirty = true;
         relayout(a);
-        furi_mutex_release(a->mutex);
-        AppEvent ev = {.type = EventData};
-        furi_message_queue_put(a->queue, &ev, 0);
-        view_port_update(a->vp);
     }
-    return 0;
+    furi_mutex_release(a->mutex);
+    AppEvent ev = {.type = EventData};
+    furi_message_queue_put(a->queue, &ev, 0);
+    view_port_update(a->vp);
+    return RX_BUF;
 }
 
 int32_t bt_reader_app(void* p) {
@@ -175,7 +189,7 @@ int32_t bt_reader_app(void* p) {
     bt_keys_storage_set_storage_path(bt, APP_DATA_PATH(".bt_reader.keys"));
     FuriHalBleProfileBase* profile = bt_profile_start(bt, ble_profile_serial, NULL);
     furi_check(profile);
-    ble_profile_serial_set_event_callback(profile, 512, rx_cb, a);
+    ble_profile_serial_set_event_callback(profile, RX_BUF, rx_cb, a);
 
     a->vp = view_port_alloc();
     view_port_draw_callback_set(a->vp, draw_cb, a);
