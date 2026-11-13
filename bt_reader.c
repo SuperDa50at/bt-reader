@@ -175,7 +175,6 @@ int32_t bt_reader_app(void* p) {
     bt_keys_storage_set_storage_path(bt, APP_DATA_PATH(".bt_reader.keys"));
     FuriHalBleProfileBase* profile = bt_profile_start(bt, ble_profile_serial, NULL);
     furi_check(profile);
-    furi_hal_bt_start_advertising();
     ble_profile_serial_set_event_callback(profile, 512, rx_cb, a);
 
     a->vp = view_port_alloc();
