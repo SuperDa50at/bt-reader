@@ -2,29 +2,15 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <storage/storage.h>
-#include <bt/bt_service/bt.h>
-#include <profiles/serial_profile.h>
-#include <stdio.h>
 #include <string.h>
 
-#define TEXT_MAX 8192
-#define LINE_MAX 1024
-#define COLS     22
-#define ROWS     6
-#define RX_BUF   512
+#define TEXT_MAX  16384
+#define LINE_MAX  2048
+#define COLS      22
+#define ROWS      5
 
 #define SAVE_DIR  EXT_PATH("apps_data/bt_reader")
 #define SAVE_FILE SAVE_DIR "/received.txt"
-
-typedef enum {
-    EventInput,
-    EventData,
-} EventType;
-
-typedef struct {
-    EventType type;
-    InputEvent input;
-} AppEvent;
 
 typedef struct {
     FuriMutex* mutex;
@@ -36,10 +22,6 @@ typedef struct {
     uint16_t line_start[LINE_MAX];
     size_t lines;
     int scroll;
-    bool connected;
-    bool dirty;
-    uint32_t rx_events;
-    uint32_t rx_bytes;
     const char* status;
 } App;
 
@@ -67,29 +49,23 @@ static void relayout(App* a) {
     }
 }
 
-static void save_to_sd(App* a) {
-    storage_simply_mkdir(a->storage, EXT_PATH("apps_data"));
-    storage_simply_mkdir(a->storage, SAVE_DIR);
-    File* f = storage_file_alloc(a->storage);
-    if(storage_file_open(f, SAVE_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        storage_file_write(f, a->text, a->len);
-        storage_file_close(f);
-        a->status = "Saved to SD";
-    } else {
-        a->status = "SD write error";
-    }
-    storage_file_free(f);
-    a->dirty = false;
-}
-
 static void load_from_sd(App* a) {
+    a->len = 0;
+    a->text[0] = 0;
     File* f = storage_file_alloc(a->storage);
     if(storage_file_open(f, SAVE_FILE, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        a->len = storage_file_read(f, a->text, TEXT_MAX - 1);
+        size_t n = storage_file_read(f, a->text, TEXT_MAX - 1);
+        for(size_t i = 0; i < n; i++) {
+            if(a->text[i] != '\r') a->text[a->len++] = a->text[i];
+        }
         a->text[a->len] = 0;
         storage_file_close(f);
+        a->status = a->len ? "Loaded" : "File is empty";
+    } else {
+        a->status = "No received.txt";
     }
     storage_file_free(f);
+    a->scroll = 0;
     relayout(a);
 }
 
@@ -98,7 +74,6 @@ static void delete_from_sd(App* a) {
     a->len = 0;
     a->text[0] = 0;
     a->scroll = 0;
-    a->dirty = false;
     a->status = "Deleted from SD";
     relayout(a);
 }
@@ -109,18 +84,11 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
     if(a->len == 0) {
-        canvas_draw_str(canvas, 2, 12, a->connected ? "Connected. Send text" : "Waiting for BLE...");
-        char info[40];
-        snprintf(
-            info,
-            sizeof(info),
-            "RX ev:%lu b:%lu",
-            (unsigned long)a->rx_events,
-            (unsigned long)a->rx_bytes);
-        canvas_draw_str(canvas, 2, 24, info);
-        canvas_draw_str(canvas, 2, 38, "Hold OK: delete file");
-        canvas_draw_str(canvas, 2, 48, "Up/Down: scroll");
-        if(a->status) canvas_draw_str(canvas, 2, 62, a->status);
+        canvas_draw_str(canvas, 2, 10, a->status ? a->status : "No text");
+        canvas_draw_str(canvas, 2, 24, "Put received.txt in:");
+        canvas_draw_str(canvas, 2, 34, "ext/apps_data/bt_reader");
+        canvas_draw_str(canvas, 2, 48, "OK: reload");
+        canvas_draw_str(canvas, 2, 58, "Hold OK: delete file");
     } else {
         for(int r = 0; r < ROWS; r++) {
             int li = a->scroll + r;
@@ -139,38 +107,17 @@ static void draw_cb(Canvas* canvas, void* ctx) {
                 p++;
             }
             buf[o] = 0;
-            canvas_draw_str(canvas, 1, 10 + r * 10, buf);
+            canvas_draw_str(canvas, 1, 10 + r * 11, buf);
         }
+        char pos[24];
+        snprintf(pos, sizeof(pos), "%d/%d", a->scroll + 1, (int)a->lines);
+        canvas_draw_str(canvas, 1, 63, pos);
     }
     furi_mutex_release(a->mutex);
 }
 
 static void input_cb(InputEvent* e, void* ctx) {
-    AppEvent ev = {.type = EventInput, .input = *e};
-    furi_message_queue_put((FuriMessageQueue*)ctx, &ev, 0);
-}
-
-static uint16_t rx_cb(SerialServiceEvent event, void* ctx) {
-    App* a = ctx;
-    furi_mutex_acquire(a->mutex, FuriWaitForever);
-    a->rx_events++;
-    a->connected = true;
-    if(event.event == SerialServiceEventTypeDataReceived) {
-        a->rx_bytes += event.data.size;
-        for(uint16_t i = 0; i < event.data.size && a->len < TEXT_MAX - 1; i++) {
-            char c = event.data.buffer[i];
-            if(c == '\r') continue;
-            a->text[a->len++] = c;
-        }
-        a->text[a->len] = 0;
-        a->dirty = true;
-        relayout(a);
-    }
-    furi_mutex_release(a->mutex);
-    AppEvent ev = {.type = EventData};
-    furi_message_queue_put(a->queue, &ev, 0);
-    view_port_update(a->vp);
-    return RX_BUF;
+    furi_message_queue_put((FuriMessageQueue*)ctx, e, 0);
 }
 
 int32_t bt_reader_app(void* p) {
@@ -178,18 +125,12 @@ int32_t bt_reader_app(void* p) {
     App* a = malloc(sizeof(App));
     memset(a, 0, sizeof(App));
     a->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    a->queue = furi_message_queue_alloc(32, sizeof(AppEvent));
+    a->queue = furi_message_queue_alloc(8, sizeof(InputEvent));
     a->storage = furi_record_open(RECORD_STORAGE);
+    storage_simply_mkdir(a->storage, EXT_PATH("apps_data"));
+    storage_simply_mkdir(a->storage, SAVE_DIR);
     a->lines = 1;
     load_from_sd(a);
-
-    Bt* bt = furi_record_open(RECORD_BT);
-    bt_disconnect(bt);
-    furi_delay_ms(200);
-    bt_keys_storage_set_storage_path(bt, APP_DATA_PATH(".bt_reader.keys"));
-    FuriHalBleProfileBase* profile = bt_profile_start(bt, ble_profile_serial, NULL);
-    furi_check(profile);
-    ble_profile_serial_set_event_callback(profile, RX_BUF, rx_cb, a);
 
     a->vp = view_port_alloc();
     view_port_draw_callback_set(a->vp, draw_cb, a);
@@ -197,42 +138,31 @@ int32_t bt_reader_app(void* p) {
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, a->vp, GuiLayerFullscreen);
 
-    AppEvent ev;
+    InputEvent ev;
     bool run = true;
     while(run) {
-        FuriStatus s = furi_message_queue_get(a->queue, &ev, 300);
+        if(furi_message_queue_get(a->queue, &ev, FuriWaitForever) != FuriStatusOk) continue;
         furi_mutex_acquire(a->mutex, FuriWaitForever);
-        if(s == FuriStatusErrorTimeout) {
-            if(a->dirty) save_to_sd(a);
-        } else if(s == FuriStatusOk && ev.type == EventInput) {
-            InputEvent* in = &ev.input;
-            int max_scroll = (int)a->lines - ROWS;
-            if(max_scroll < 0) max_scroll = 0;
-            if(in->type == InputTypeShort || in->type == InputTypeRepeat) {
-                if(in->key == InputKeyUp && a->scroll > 0) a->scroll--;
-                if(in->key == InputKeyDown && a->scroll < max_scroll) a->scroll++;
-                if(in->key == InputKeyBack) run = false;
-            } else if(in->type == InputTypeLong && in->key == InputKeyOk) {
-                delete_from_sd(a);
-            }
+        int max_scroll = (int)a->lines - ROWS;
+        if(max_scroll < 0) max_scroll = 0;
+        if(ev.type == InputTypeShort || ev.type == InputTypeRepeat) {
+            if(ev.key == InputKeyUp && a->scroll > 0) a->scroll--;
+            if(ev.key == InputKeyDown && a->scroll < max_scroll) a->scroll++;
+            if(ev.key == InputKeyLeft) a->scroll = (a->scroll > ROWS) ? a->scroll - ROWS : 0;
+            if(ev.key == InputKeyRight)
+                a->scroll = (a->scroll + ROWS < max_scroll) ? a->scroll + ROWS : max_scroll;
+            if(ev.key == InputKeyOk && ev.type == InputTypeShort) load_from_sd(a);
+            if(ev.key == InputKeyBack) run = false;
+        } else if(ev.type == InputTypeLong && ev.key == InputKeyOk) {
+            delete_from_sd(a);
         }
         furi_mutex_release(a->mutex);
         view_port_update(a->vp);
     }
 
-    ble_profile_serial_set_event_callback(profile, 0, NULL, NULL);
-    furi_mutex_acquire(a->mutex, FuriWaitForever);
-    if(a->dirty) save_to_sd(a);
-    furi_mutex_release(a->mutex);
-
     gui_remove_view_port(gui, a->vp);
     furi_record_close(RECORD_GUI);
     view_port_free(a->vp);
-    bt_disconnect(bt);
-    furi_delay_ms(200);
-    bt_keys_storage_set_default_path(bt);
-    bt_profile_restore_default(bt);
-    furi_record_close(RECORD_BT);
     furi_record_close(RECORD_STORAGE);
     furi_message_queue_free(a->queue);
     furi_mutex_free(a->mutex);
