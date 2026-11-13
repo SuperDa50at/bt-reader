@@ -1,0 +1,9 @@
+App(
+    appid="bt_reader",
+    name="BT Reader",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="bt_reader_app",
+    stack_size=2 * 1024,
+    fap_category="Bluetooth",
+    requires=["gui", "bt", "storage"],
+)
